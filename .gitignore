@@ -5,5 +5,5 @@ __pycache__/
 .env
 .venv/
 venv/
-recruitment_api/uploads/
-recruitment_api/exports/
+uploads/
+exports/
