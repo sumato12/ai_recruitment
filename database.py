@@ -44,9 +44,15 @@ def create_tables():
             certifications    TEXT,
             summary           TEXT,
             semantic_score    REAL    DEFAULT 0,
+            skill_score       REAL    DEFAULT 0,
+            projects_score    REAL    DEFAULT 0,
+            experience_score  REAL    DEFAULT 0,
+            total_score       REAL    DEFAULT 0,
             score             REAL    DEFAULT 0,
             rank              INTEGER DEFAULT 0,
             score_reasoning   TEXT,
+            needs_review      INTEGER DEFAULT 0,
+            review_reason     TEXT,
             created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
         )
@@ -58,6 +64,12 @@ def create_tables():
     _ensure_column(conn, "jobs", "embedding TEXT")
     _ensure_column(conn, "candidates", "embedding TEXT")
     _ensure_column(conn, "candidates", "semantic_score REAL DEFAULT 0")
+    _ensure_column(conn, "candidates", "skill_score REAL DEFAULT 0")
+    _ensure_column(conn, "candidates", "projects_score REAL DEFAULT 0")
+    _ensure_column(conn, "candidates", "experience_score REAL DEFAULT 0")
+    _ensure_column(conn, "candidates", "total_score REAL DEFAULT 0")
+    _ensure_column(conn, "candidates", "needs_review INTEGER DEFAULT 0")
+    _ensure_column(conn, "candidates", "review_reason TEXT")
 
     conn.commit()
     conn.close()

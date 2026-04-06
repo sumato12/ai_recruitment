@@ -66,6 +66,144 @@ def _clean_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        clean = _clean_text(value)
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(clean)
+    return unique
+
+
+def extract_candidate_info_fallback(resume_text: str) -> dict:
+    """Best-effort parser used when AI extraction is unavailable."""
+    text = _clean_text(resume_text)
+    lines = [re.sub(r"\s+", " ", line).strip(" -\t\r\n") for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
+    email_match = re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text)
+    phone_match = re.search(r"(\+?\d[\d\s().-]{7,}\d)", text)
+
+    name = ""
+    for line in lines[:12]:
+        if re.search(r"@|https?://|linkedin|github|\d", line, re.IGNORECASE):
+            continue
+        if re.search(
+            r"\b(resume|curriculum|vitae|profile|summary|skills|experience|education)\b",
+            line,
+            re.IGNORECASE,
+        ):
+            continue
+        if re.fullmatch(r"[A-Za-z][A-Za-z'`.-]*(?:\s+[A-Za-z][A-Za-z'`.-]*){1,4}", line):
+            name = line
+            break
+    if not name:
+        for line in lines[:3]:
+            if "@" not in line and len(line.split()) <= 6:
+                name = line
+                break
+
+    exp_matches = re.findall(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)", text, re.IGNORECASE)
+    total_experience = ""
+    if exp_matches:
+        max_exp = max(float(x) for x in exp_matches)
+        total_experience = f"{max_exp:g} years"
+
+    skill_keywords = [
+        "Python",
+        "Java",
+        "JavaScript",
+        "TypeScript",
+        "SQL",
+        "Django",
+        "Flask",
+        "FastAPI",
+        "React",
+        "Node.js",
+        "AWS",
+        "Azure",
+        "Docker",
+        "Kubernetes",
+        "Git",
+        "Selenium",
+        "PyTorch",
+        "TensorFlow",
+        "Pandas",
+        "NumPy",
+    ]
+    detected_skills: list[str] = []
+    for keyword in skill_keywords:
+        pattern = rf"(?<!\w){re.escape(keyword)}(?!\w)"
+        if re.search(pattern, text, re.IGNORECASE):
+            detected_skills.append(keyword)
+
+    for match in re.finditer(r"(?:^|\n)\s*(?:technical\s+)?skills?\s*[:\-]\s*(.+)", text, re.IGNORECASE):
+        inline = match.group(1)
+        detected_skills.extend([token.strip() for token in re.split(r"[,;/|]", inline) if token.strip()])
+
+    education_lines = [
+        line
+        for line in lines
+        if re.search(
+            r"\b(bachelor|master|ph\.?d|mba|b\.?s|m\.?s|bsc|msc|university|college|institute)\b",
+            line,
+            re.IGNORECASE,
+        )
+    ]
+    certification_lines = [
+        line
+        for line in lines
+        if re.search(
+            r"\b(certified|certification|certificate|aws certified|azure certified|pmp|scrum)\b",
+            line,
+            re.IGNORECASE,
+        )
+    ]
+
+    summary_parts: list[str] = []
+    for line in lines:
+        if re.search(r"@|https?://|linkedin|github", line, re.IGNORECASE):
+            continue
+        if re.search(r"^\d+$", line):
+            continue
+        if len(line) < 25:
+            continue
+        if re.search(r"\b(skills?|experience|education|certifications?)\b:?\s*$", line, re.IGNORECASE):
+            continue
+        summary_parts.append(line)
+        if len(summary_parts) >= 3:
+            break
+
+    summary = " ".join(summary_parts)
+    if not summary:
+        summary = text[:280]
+
+    return {
+        "name": name,
+        "email": email_match.group(0) if email_match else "",
+        "phone": phone_match.group(1).strip() if phone_match else "",
+        "total_experience": total_experience,
+        "skills": ", ".join(_dedupe_keep_order(detected_skills[:20])),
+        "education": ", ".join(_dedupe_keep_order(education_lines[:3])),
+        "certifications": ", ".join(_dedupe_keep_order(certification_lines[:3])),
+        "summary": summary[:500],
+    }
+
+
+def _coerce_score(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, min(100.0, parsed)), 2)
+
+
 def build_job_embedding_text(
     title: str,
     description: str,
@@ -158,8 +296,47 @@ def combine_scores(semantic: float, llm: float | None = None) -> float:
     return round(blended, 2)
 
 
+def combine_component_scores(
+    skill_score: Any,
+    projects_score: Any,
+    experience_score: Any,
+    *,
+    skill_weight: float,
+    projects_weight: float,
+    experience_weight: float,
+) -> float:
+    skill = _coerce_score(skill_score)
+    projects = _coerce_score(projects_score)
+    experience = _coerce_score(experience_score)
+
+    try:
+        w_skill = float(skill_weight)
+    except (TypeError, ValueError):
+        w_skill = 0.0
+    try:
+        w_projects = float(projects_weight)
+    except (TypeError, ValueError):
+        w_projects = 0.0
+    try:
+        w_experience = float(experience_weight)
+    except (TypeError, ValueError):
+        w_experience = 0.0
+
+    total_weight = w_skill + w_projects + w_experience
+    if total_weight <= 0:
+        return round((skill + projects + experience) / 3, 2)
+
+    blended = (
+        (skill * w_skill) + (projects * w_projects) + (experience * w_experience)
+    ) / total_weight
+    return _coerce_score(blended)
+
+
 def _chat_completion_json(system_prompt: str, user_prompt: str) -> dict:
     """Call AI with timeout/retry and parse JSON output."""
+    if not _clean_text(AZURE_OPENAI_API_KEY):
+        raise RuntimeError("AZURE_OPENAI_API_KEY is not set")
+
     last_error = None
 
     for attempt in range(1, AI_MAX_RETRIES + 1):
@@ -181,13 +358,17 @@ def _chat_completion_json(system_prompt: str, user_prompt: str) -> dict:
                 break
             time.sleep(AI_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
 
+    err_type = type(last_error).__name__ if last_error else "UnknownError"
     raise RuntimeError(
-        f"AI request failed after {AI_MAX_RETRIES} attempt(s): {last_error}"
+        f"AI request failed after {AI_MAX_RETRIES} attempt(s): {err_type}: {last_error}"
     ) from last_error
 
 
 async def _chat_completion_json_async(system_prompt: str, user_prompt: str) -> dict:
     """Async AI call with timeout/retry and JSON parsing."""
+    if not _clean_text(AZURE_OPENAI_API_KEY):
+        raise RuntimeError("AZURE_OPENAI_API_KEY is not set")
+
     last_error = None
 
     for attempt in range(1, AI_MAX_RETRIES + 1):
@@ -209,8 +390,9 @@ async def _chat_completion_json_async(system_prompt: str, user_prompt: str) -> d
                 break
             await asyncio.sleep(AI_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
 
+    err_type = type(last_error).__name__ if last_error else "UnknownError"
     raise RuntimeError(
-        f"AI request failed after {AI_MAX_RETRIES} attempt(s): {last_error}"
+        f"AI request failed after {AI_MAX_RETRIES} attempt(s): {err_type}: {last_error}"
     ) from last_error
 
 
@@ -274,21 +456,20 @@ def score_candidate(
     min_experience: int | str,
     candidate: dict,
 ) -> dict:
-    """Score a candidate 0-100 against a job description."""
+    """Return component scores (skills/projects/experience) for one candidate."""
 
-    prompt = f"""You are an expert HR recruiter. Score this candidate against the full job requirement set (0-100).
+    prompt = f"""You are an expert HR recruiter. Evaluate this candidate against job requirements.
 
-Weighting:
-  Skill match          – 40 %
-  Experience relevance – 30 %
-  Education / certs    – 20 %
-  Overall fit          – 10 %
+Score each dimension from 0 to 100:
+1) skill_score: match between required job skills and candidate skills.
+2) projects_score: relevance/quality of projects and work history against the job description.
+3) experience_score: fit of candidate experience vs minimum required experience.
 
 Important:
-- Compare candidate skills against required job skills.
-- Compare candidate total experience against minimum required experience.
-- If required skills or minimum experience are clearly missing, reduce the score accordingly.
-- Mention key skill and experience gaps in reasoning when present.
+- Compare candidate skills directly with required job skills.
+- Infer project relevance from resume summary and resume excerpt/work history.
+- Penalize clearly missing core skills or insufficient experience.
+- Keep scoring strict and realistic.
 
 Job Description:
 \"\"\"
@@ -305,8 +486,13 @@ Candidate:
   Certifications : {candidate.get("certifications", "N/A")}
   Summary        : {candidate.get("summary", "N/A")}
 
-Return ONLY a JSON object:
-  {{"score": <int 0-100>, "reasoning": "<2-3 sentences>"}}"""
+Resume Excerpt:
+\"\"\"
+{_clean_text(candidate.get("raw_text"))[:6000]}
+\"\"\"
+
+Return ONLY a JSON object with EXACTLY these keys:
+{{"skill_score": <number 0-100>, "projects_score": <number 0-100>, "experience_score": <number 0-100>, "reasoning": "<2-3 sentences>"}}"""
 
     return _chat_completion_json(
         system_prompt="You are an HR scoring assistant. Return only valid JSON.",
@@ -320,21 +506,20 @@ async def score_candidate_async(
     min_experience: int | str,
     candidate: dict,
 ) -> dict:
-    """Async version: score a candidate 0-100 against a job description."""
+    """Async version: return component scores (skills/projects/experience)."""
 
-    prompt = f"""You are an expert HR recruiter. Score this candidate against the full job requirement set (0-100).
+    prompt = f"""You are an expert HR recruiter. Evaluate this candidate against job requirements.
 
-Weighting:
-  Skill match          – 40 %
-  Experience relevance – 30 %
-  Education / certs    – 20 %
-  Overall fit          – 10 %
+Score each dimension from 0 to 100:
+1) skill_score: match between required job skills and candidate skills.
+2) projects_score: relevance/quality of projects and work history against the job description.
+3) experience_score: fit of candidate experience vs minimum required experience.
 
 Important:
-- Compare candidate skills against required job skills.
-- Compare candidate total experience against minimum required experience.
-- If required skills or minimum experience are clearly missing, reduce the score accordingly.
-- Mention key skill and experience gaps in reasoning when present.
+- Compare candidate skills directly with required job skills.
+- Infer project relevance from resume summary and resume excerpt/work history.
+- Penalize clearly missing core skills or insufficient experience.
+- Keep scoring strict and realistic.
 
 Job Description:
 \"\"\"
@@ -351,8 +536,13 @@ Candidate:
   Certifications : {candidate.get("certifications", "N/A")}
   Summary        : {candidate.get("summary", "N/A")}
 
-Return ONLY a JSON object:
-  {{"score": <int 0-100>, "reasoning": "<2-3 sentences>"}}"""
+Resume Excerpt:
+\"\"\"
+{_clean_text(candidate.get("raw_text"))[:6000]}
+\"\"\"
+
+Return ONLY a JSON object with EXACTLY these keys:
+{{"skill_score": <number 0-100>, "projects_score": <number 0-100>, "experience_score": <number 0-100>, "reasoning": "<2-3 sentences>"}}"""
 
     return await _chat_completion_json_async(
         system_prompt="You are an HR scoring assistant. Return only valid JSON.",

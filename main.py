@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import sqlite3
 import zipfile
 from datetime import datetime
@@ -13,8 +14,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from config import (
+    EXPERIENCE_SCORE_WEIGHT,
     EXPORT_DIR,
     MAX_UPLOAD_SIZE_BYTES,
+    PROJECTS_SCORE_WEIGHT,
+    SKILL_SCORE_WEIGHT,
     UPLOAD_DIR,
     UPLOAD_MAX_SIZE_MB,
     USE_LLM_IN_RANKING,
@@ -23,8 +27,9 @@ from database import create_tables, get_db
 from services.ai_service import (
     build_candidate_embedding_text,
     build_job_embedding_text,
-    combine_scores,
+    combine_component_scores,
     extract_candidate_info_async,
+    extract_candidate_info_fallback,
     get_embedding,
     score_candidate_async,
     semantic_score,
@@ -100,6 +105,18 @@ def _embedding_from_db(value: str | None) -> list[float]:
     return []
 
 
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_score(value: object, default: float = 0.0) -> float:
+    parsed = _to_float(value, default)
+    return round(max(0.0, min(100.0, parsed)), 2)
+
+
 async def _process_single_resume(
     cur: sqlite3.Cursor,
     conn: sqlite3.Connection,
@@ -113,10 +130,19 @@ async def _process_single_resume(
     if not raw_text or len(raw_text) < 50:
         return {"file": filename, "error": "Could not extract enough text"}
 
+    parser_mode = "ai"
+    parser_warning: str | None = None
     try:
         info = await extract_candidate_info_async(raw_text)
     except Exception as exc:
-        return {"file": filename, "error": f"AI extraction failed: {exc}"}
+        info = extract_candidate_info_fallback(raw_text)
+        parser_mode = "heuristic"
+        parser_warning = f"AI extraction failed, heuristic parser used: {exc}"
+
+    if not (info.get("name") or "").strip():
+        stem = os.path.splitext(filename)[0]
+        fallback_name = re.sub(r"[_\-.]+", " ", stem).strip()
+        info["name"] = fallback_name[:80]
 
     embedding_json = None
     try:
@@ -168,6 +194,8 @@ async def _process_single_resume(
         "name": info.get("name", ""),
         "email": info.get("email", ""),
         "skills": info.get("skills", ""),
+        "parser_mode": parser_mode,
+        "warning": parser_warning,
     }
 
 
@@ -304,7 +332,7 @@ async def upload_resumes(
 
 @app.post("/jobs/{job_id}/rank-candidates/", tags=["Ranking"])
 async def rank_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db)):
-    """Rank candidates using semantic similarity, optionally blended with LLM score."""
+    """Rank candidates using component LLM scores (skills/projects/experience)."""
 
     job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if not job:
@@ -352,34 +380,110 @@ async def rank_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db))
                 )
 
             semantic = round(semantic_score(job_embedding, cand_embedding), 2)
-            llm_score_val: float | None = None
-            reasoning = "Semantic ranking generated from embedding similarity."
+            skill_score = _clamp_score(c.get("skill_score"))
+            projects_score = _clamp_score(c.get("projects_score"))
+            experience_score = _clamp_score(c.get("experience_score"))
+            total_score = _clamp_score(c.get("total_score"), _to_float(c.get("score")))
+            if total_score <= 0 and any(
+                score > 0 for score in (skill_score, projects_score, experience_score)
+            ):
+                total_score = combine_component_scores(
+                    skill_score,
+                    projects_score,
+                    experience_score,
+                    skill_weight=SKILL_SCORE_WEIGHT,
+                    projects_weight=PROJECTS_SCORE_WEIGHT,
+                    experience_weight=EXPERIENCE_SCORE_WEIGHT,
+                )
+            had_prior_scores = any(
+                score > 0
+                for score in (skill_score, projects_score, experience_score, total_score)
+            )
+            needs_review = 0
+            review_reason: str | None = None
+            reasoning = "Component-based ranking generated from LLM evaluation."
 
             if USE_LLM_IN_RANKING:
-                ai = await score_candidate_async(
-                    job["description"],
-                    job["skills"] if "skills" in job.keys() else "",
-                    job["experience"] if "experience" in job.keys() else 0,
-                    c,
+                try:
+                    ai = await score_candidate_async(
+                        job["description"],
+                        job["skills"] if "skills" in job.keys() else "",
+                        job["experience"] if "experience" in job.keys() else 0,
+                        c,
+                    )
+                    skill_score = _clamp_score(ai.get("skill_score"))
+                    projects_score = _clamp_score(ai.get("projects_score"))
+                    experience_score = _clamp_score(ai.get("experience_score"))
+                    total_score = combine_component_scores(
+                        skill_score,
+                        projects_score,
+                        experience_score,
+                        skill_weight=SKILL_SCORE_WEIGHT,
+                        projects_weight=PROJECTS_SCORE_WEIGHT,
+                        experience_weight=EXPERIENCE_SCORE_WEIGHT,
+                    )
+                    llm_reasoning = ai.get("reasoning", "")
+                    if llm_reasoning:
+                        reasoning = llm_reasoning
+                    needs_review = 0
+                    review_reason = None
+                except Exception as llm_exc:
+                    if not had_prior_scores:
+                        skill_score = 0.0
+                        projects_score = 0.0
+                        experience_score = 0.0
+                        total_score = 0.0
+                    needs_review = 1
+                    review_reason = f"LLM component scoring failed: {llm_exc}"
+                    if had_prior_scores:
+                        reasoning = (
+                            "Candidate flagged for manual review because LLM component "
+                            "scoring failed. Existing scores were preserved."
+                        )
+                    else:
+                        reasoning = (
+                            "Candidate flagged for manual review because LLM component "
+                            "scoring failed before component scores were available."
+                        )
+            else:
+                needs_review = 1
+                review_reason = "LLM component scoring is disabled by configuration."
+                reasoning = (
+                    "Candidate flagged for manual review because LLM component scoring "
+                    "is disabled."
                 )
-                llm_score_val = float(ai.get("score", 0))
-                llm_reasoning = ai.get("reasoning", "")
-                if llm_reasoning:
-                    reasoning = llm_reasoning
 
-            final_score = combine_scores(semantic, llm_score_val)
             cur.execute(
                 """UPDATE candidates
-                   SET semantic_score = ?, score = ?, score_reasoning = ?
+                   SET semantic_score = ?, skill_score = ?, projects_score = ?,
+                       experience_score = ?, total_score = ?, score = ?,
+                       score_reasoning = ?, needs_review = ?, review_reason = ?
                    WHERE id = ?""",
-                (semantic, final_score, reasoning, c["id"]),
+                (
+                    semantic,
+                    skill_score,
+                    projects_score,
+                    experience_score,
+                    total_score,
+                    total_score,  # Backward-compat alias for existing clients.
+                    reasoning,
+                    needs_review,
+                    review_reason,
+                    c["id"],
+                ),
             )
             results.append(
                 {
                     "id": c["id"],
                     "name": c["name"],
                     "semantic_score": semantic,
-                    "score": final_score,
+                    "skill_score": skill_score,
+                    "projects_score": projects_score,
+                    "experience_score": experience_score,
+                    "total_score": total_score,
+                    "score": total_score,
+                    "needs_review": bool(needs_review),
+                    "review_reason": review_reason,
                     "reasoning": reasoning,
                 }
             )
@@ -387,15 +491,22 @@ async def rank_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db))
             err = str(exc)
             cur.execute(
                 """UPDATE candidates
-                   SET semantic_score = 0, score = 0, score_reasoning = ?
+                   SET semantic_score = 0, skill_score = 0, projects_score = 0,
+                       experience_score = 0, total_score = 0, score = 0,
+                       score_reasoning = ?, needs_review = 1, review_reason = ?
                    WHERE id = ?""",
-                (f"Ranking failed: {err}", c["id"]),
+                (
+                    f"Ranking failed: {err}",
+                    f"Ranking pipeline failed: {err}",
+                    c["id"],
+                ),
             )
             results.append({"id": c["id"], "name": c["name"], "error": err})
 
     # assign ranks (1 = best)
     ranked_ids = db.execute(
-        "SELECT id FROM candidates WHERE job_id = ? ORDER BY score DESC", (job_id,)
+        "SELECT id FROM candidates WHERE job_id = ? ORDER BY total_score DESC, semantic_score DESC",
+        (job_id,),
     ).fetchall()
     for idx, row in enumerate(ranked_ids, 1):
         cur.execute("UPDATE candidates SET rank = ? WHERE id = ?", (idx, row["id"]))
@@ -405,7 +516,9 @@ async def rank_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db))
     # return final ranked list
     final = db.execute(
         """SELECT id, name, email, phone, total_experience, skills, education,
-                  certifications, semantic_score, score, rank, score_reasoning
+                  certifications, semantic_score, skill_score, projects_score,
+                  experience_score, total_score, score, needs_review, review_reason,
+                  rank, score_reasoning
            FROM candidates WHERE job_id = ? ORDER BY rank""",
         (job_id,),
     ).fetchall()
@@ -421,7 +534,9 @@ def list_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db)):
     rows = db.execute(
         """SELECT id, file_name, name, email, phone, total_experience,
                   skills, education, certifications, summary,
-                  semantic_score, score, rank, score_reasoning, created_at
+                  semantic_score, skill_score, projects_score, experience_score,
+                  total_score, score, needs_review, review_reason,
+                  rank, score_reasoning, created_at
            FROM candidates WHERE job_id = ? ORDER BY rank ASC, created_at DESC""",
         (job_id,),
     ).fetchall()
@@ -477,7 +592,9 @@ def export_excel(job_id: int, db: sqlite3.Connection = Depends(get_db)):
 
     rows = db.execute(
         """SELECT name, email, phone, total_experience, skills, education,
-                  certifications, semantic_score, score, rank, score_reasoning
+                  certifications, semantic_score, skill_score, projects_score,
+                  experience_score, total_score, needs_review, review_reason,
+                  rank, score_reasoning
            FROM candidates WHERE job_id = ? ORDER BY rank ASC""",
         (job_id,),
     ).fetchall()
@@ -488,7 +605,10 @@ def export_excel(job_id: int, db: sqlite3.Connection = Depends(get_db)):
     df = pd.DataFrame([dict(r) for r in rows])
     df.columns = [
         "Name", "Email", "Phone", "Total Experience", "Key Skills",
-        "Education", "Certifications", "Semantic Score", "Final Score", "Rank", "Score Reasoning",
+        "Education", "Certifications", "Semantic Score (out of 100)",
+        "Skill Score (out of 100)", "Projects Score (out of 100)",
+        "Experience Score (out of 100)", "Total Score (out of 100)", "Needs Review",
+        "Review Reason", "Rank", "Score Reasoning",
     ]
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
