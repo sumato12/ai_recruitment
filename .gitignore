@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite3
+.env
+.venv/
+venv/
+recruitment_api/uploads/
+recruitment_api/exports/
