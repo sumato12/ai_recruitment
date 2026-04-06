@@ -9,7 +9,7 @@ from typing import List
 
 import pandas as pd
 from fastapi.concurrency import run_in_threadpool
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -30,6 +30,8 @@ from services.ai_service import (
     combine_component_scores,
     extract_candidate_info_async,
     extract_candidate_info_fallback,
+    generate_interview_questions_async,
+    generate_interview_questions_fallback,
     get_embedding,
     score_candidate_async,
     semantic_score,
@@ -245,6 +247,7 @@ def get_job(job_id: int, db: sqlite3.Connection = Depends(get_db)):
 @app.delete("/jobs/{job_id}", tags=["Jobs"])
 def delete_job(job_id: int, db: sqlite3.Connection = Depends(get_db)):
     cur = db.cursor()
+    cur.execute("DELETE FROM candidate_questionnaires WHERE job_id = ?", (job_id,))
     cur.execute("DELETE FROM candidates WHERE job_id = ?", (job_id,))
     cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     db.commit()
@@ -526,6 +529,276 @@ async def rank_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db))
     return {"message": f"Ranked {len(final)} candidate(s)", "candidates": [dict(r) for r in final]}
 
 
+# ── Interview Questionnaires ────────────────────────────────────────────────
+
+
+@app.post("/jobs/{job_id}/generate-questionnaires/", tags=["Interview"])
+async def generate_questionnaires(
+    job_id: int,
+    top_n: int = Query(5, ge=1, le=50),
+    questions_per_candidate: int = Query(8, ge=3, le=20),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """Generate personalized interview questions for top-ranked candidates."""
+
+    job_row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job_row:
+        raise HTTPException(404, "Job not found")
+
+    candidate_count = db.execute(
+        "SELECT COUNT(*) FROM candidates WHERE job_id = ?", (job_id,)
+    ).fetchone()[0]
+    if candidate_count == 0:
+        raise HTTPException(404, "No candidates found for this job")
+
+    ranked_count = db.execute(
+        "SELECT COUNT(*) FROM candidates WHERE job_id = ? AND rank > 0", (job_id,)
+    ).fetchone()[0]
+    if ranked_count == 0:
+        await rank_candidates(job_id, db)
+
+    top_rows = db.execute(
+        """SELECT * FROM candidates
+           WHERE job_id = ?
+           ORDER BY rank ASC, total_score DESC, semantic_score DESC
+           LIMIT ?""",
+        (job_id, top_n),
+    ).fetchall()
+    if not top_rows:
+        raise HTTPException(404, "No ranked candidates available")
+
+    cur = db.cursor()
+    generated: list[dict] = []
+    job = dict(job_row)
+
+    for candidate_row in top_rows:
+        candidate = dict(candidate_row)
+        generation_mode = "ai"
+        warning: str | None = None
+
+        try:
+            questions = await generate_interview_questions_async(
+                job,
+                candidate,
+                questions_per_candidate,
+            )
+        except Exception as exc:
+            questions = generate_interview_questions_fallback(
+                job,
+                candidate,
+                questions_per_candidate,
+            )
+            generation_mode = "fallback"
+            warning = f"AI questionnaire generation failed, fallback used: {exc}"
+
+        cur.execute(
+            "DELETE FROM candidate_questionnaires WHERE candidate_id = ?",
+            (candidate["id"],),
+        )
+        for idx, item in enumerate(questions, 1):
+            cur.execute(
+                """INSERT INTO candidate_questionnaires
+                       (job_id, candidate_id, question_order, question_text, focus_area,
+                        difficulty, reasoning, generation_mode)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job_id,
+                    candidate["id"],
+                    idx,
+                    item.get("question", "").strip(),
+                    item.get("focus_area", "general"),
+                    item.get("difficulty", "medium"),
+                    item.get("reason", ""),
+                    generation_mode,
+                ),
+            )
+
+        generated.append(
+            {
+                "candidate_id": candidate["id"],
+                "name": candidate.get("name", ""),
+                "rank": candidate.get("rank", 0),
+                "total_score": candidate.get("total_score", 0),
+                "needs_review": bool(candidate.get("needs_review", 0)),
+                "generation_mode": generation_mode,
+                "warning": warning,
+                "questions_count": len(questions),
+                "questions": questions,
+            }
+        )
+
+    db.commit()
+    return {
+        "message": f"Generated questionnaires for {len(generated)} candidate(s)",
+        "job_id": job_id,
+        "top_n": top_n,
+        "questions_per_candidate": questions_per_candidate,
+        "candidates": generated,
+    }
+
+
+@app.get("/jobs/{job_id}/questionnaires/", tags=["Interview"])
+def list_job_questionnaires(job_id: int, db: sqlite3.Connection = Depends(get_db)):
+    rows = db.execute(
+        """SELECT q.candidate_id, c.name, c.email, c.rank, c.total_score, c.needs_review,
+                  q.question_order, q.question_text, q.focus_area, q.difficulty,
+                  q.reasoning, q.generation_mode, q.created_at
+           FROM candidate_questionnaires q
+           JOIN candidates c ON c.id = q.candidate_id
+           WHERE q.job_id = ?
+           ORDER BY c.rank ASC, q.candidate_id ASC, q.question_order ASC""",
+        (job_id,),
+    ).fetchall()
+    if not rows:
+        raise HTTPException(404, "No questionnaires found for this job")
+
+    grouped: dict[int, dict] = {}
+    for row in rows:
+        item = dict(row)
+        candidate_id = item["candidate_id"]
+        if candidate_id not in grouped:
+            grouped[candidate_id] = {
+                "candidate_id": candidate_id,
+                "name": item.get("name", ""),
+                "email": item.get("email", ""),
+                "rank": item.get("rank", 0),
+                "total_score": item.get("total_score", 0),
+                "needs_review": bool(item.get("needs_review", 0)),
+                "questions": [],
+            }
+        grouped[candidate_id]["questions"].append(
+            {
+                "order": item.get("question_order", 0),
+                "question": item.get("question_text", ""),
+                "focus_area": item.get("focus_area", "general"),
+                "difficulty": item.get("difficulty", "medium"),
+                "reason": item.get("reasoning", ""),
+                "generation_mode": item.get("generation_mode", "ai"),
+                "created_at": item.get("created_at"),
+            }
+        )
+
+    return list(grouped.values())
+
+
+@app.get("/candidates/{candidate_id}/questionnaire/", tags=["Interview"])
+def get_candidate_questionnaire(
+    candidate_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    candidate = db.execute(
+        """SELECT id, job_id, name, email, rank, total_score, needs_review
+           FROM candidates WHERE id = ?""",
+        (candidate_id,),
+    ).fetchone()
+    if not candidate:
+        raise HTTPException(404, "Candidate not found")
+
+    rows = db.execute(
+        """SELECT question_order, question_text, focus_area, difficulty,
+                  reasoning, generation_mode, created_at
+           FROM candidate_questionnaires
+           WHERE candidate_id = ?
+           ORDER BY question_order ASC""",
+        (candidate_id,),
+    ).fetchall()
+    if not rows:
+        raise HTTPException(404, "No questionnaire found for this candidate")
+
+    candidate_data = dict(candidate)
+    return {
+        "candidate_id": candidate_data["id"],
+        "job_id": candidate_data["job_id"],
+        "name": candidate_data.get("name", ""),
+        "email": candidate_data.get("email", ""),
+        "rank": candidate_data.get("rank", 0),
+        "total_score": candidate_data.get("total_score", 0),
+        "needs_review": bool(candidate_data.get("needs_review", 0)),
+        "questions": [
+            {
+                "order": item["question_order"],
+                "question": item["question_text"],
+                "focus_area": item["focus_area"] or "general",
+                "difficulty": item["difficulty"] or "medium",
+                "reason": item["reasoning"] or "",
+                "generation_mode": item["generation_mode"] or "ai",
+                "created_at": item["created_at"],
+            }
+            for item in rows
+        ],
+    }
+
+
+# ── Master Pipeline ──────────────────────────────────────────────────────────
+
+
+@app.post(
+    "/jobs/{job_id}/run-pipeline/",
+    tags=["Pipeline"],
+    description=(
+        "Master endpoint: optional resume upload -> ranking -> questionnaire generation. "
+        "Job creation is intentionally outside this pipeline."
+    ),
+)
+async def run_master_pipeline(
+    job_id: int,
+    top_n: int = Query(5, ge=1, le=50),
+    questions_per_candidate: int = Query(8, ge=3, le=20),
+    files: List[UploadFile] | None = File(default=None),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Run end-to-end recruitment flow for an existing job:
+      1) Optional resume upload/extraction
+      2) Candidate ranking
+      3) Personalized questionnaire generation for top candidates
+    """
+
+    job_exists = db.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job_exists:
+        raise HTTPException(404, "Job not found")
+
+    upload_result: dict | None = None
+    uploaded_files = [f for f in (files or []) if f is not None]
+    if uploaded_files:
+        upload_result = await upload_resumes(job_id, uploaded_files, db)
+
+    candidate_count = db.execute(
+        "SELECT COUNT(*) FROM candidates WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()[0]
+    if candidate_count == 0:
+        raise HTTPException(
+            404,
+            "No candidates found for this job. Upload resumes first or pass files to this endpoint.",
+        )
+
+    ranking_result = await rank_candidates(job_id, db)
+    questionnaire_result = await generate_questionnaires(
+        job_id=job_id,
+        top_n=top_n,
+        questions_per_candidate=questions_per_candidate,
+        db=db,
+    )
+
+    return {
+        "message": "Master pipeline completed",
+        "job_id": job_id,
+        "uploaded": upload_result,
+        "ranking": {
+            "message": ranking_result.get("message"),
+            "candidates_count": len(ranking_result.get("candidates", [])),
+        },
+        "questionnaires": {
+            "message": questionnaire_result.get("message"),
+            "top_n": questionnaire_result.get("top_n"),
+            "questions_per_candidate": questionnaire_result.get("questions_per_candidate"),
+            "candidates_count": len(questionnaire_result.get("candidates", [])),
+            "candidates": questionnaire_result.get("candidates", []),
+        },
+    }
+
+
 # ── Candidate Endpoints ─────────────────────────────────────────────────────
 
 
@@ -554,6 +827,7 @@ def get_candidate(candidate_id: int, db: sqlite3.Connection = Depends(get_db)):
 @app.delete("/candidates/{candidate_id}", tags=["Candidates"])
 def delete_candidate(candidate_id: int, db: sqlite3.Connection = Depends(get_db)):
     cur = db.cursor()
+    cur.execute("DELETE FROM candidate_questionnaires WHERE candidate_id = ?", (candidate_id,))
     cur.execute("DELETE FROM candidates WHERE id = ?", (candidate_id,))
     db.commit()
     if cur.rowcount == 0:
@@ -572,6 +846,7 @@ def delete_all_candidates(db: sqlite3.Connection = Depends(get_db)):
     if count == 0:
         raise HTTPException(404, "Candidate not found")
 
+    cur.execute("DELETE FROM candidate_questionnaires")
     cur.execute("DELETE FROM candidates")
     db.commit()
 

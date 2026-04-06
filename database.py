@@ -14,6 +14,7 @@ def get_db():
 
 def create_tables():
     conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON")
     cur = conn.cursor()
 
     cur.execute("""
@@ -56,6 +57,28 @@ def create_tables():
             created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
         )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS candidate_questionnaires (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id           INTEGER NOT NULL,
+            candidate_id     INTEGER NOT NULL,
+            question_order   INTEGER NOT NULL,
+            question_text    TEXT    NOT NULL,
+            focus_area       TEXT,
+            difficulty       TEXT,
+            reasoning        TEXT,
+            generation_mode  TEXT    DEFAULT 'ai',
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+            FOREIGN KEY (candidate_id) REFERENCES candidates(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_questionnaires_candidate_order
+        ON candidate_questionnaires(candidate_id, question_order)
     """)
 
     # Backfill schema changes for existing databases.

@@ -548,3 +548,263 @@ Return ONLY a JSON object with EXACTLY these keys:
         system_prompt="You are an HR scoring assistant. Return only valid JSON.",
         user_prompt=prompt,
     )
+
+
+def _split_csv_like(value: Any) -> list[str]:
+    text = _clean_text(value)
+    if not text:
+        return []
+    tokens = re.split(r"[,;/|\n]+", text)
+    cleaned: list[str] = []
+    for token in tokens:
+        item = re.sub(r"\s+", " ", token).strip(" -\t\r\n")
+        if len(item) < 2:
+            continue
+        cleaned.append(item)
+    return _dedupe_keep_order(cleaned)
+
+
+def _extract_years(value: Any) -> float:
+    text = _clean_text(value)
+    match = re.search(r"(\d+(?:\.\d+)?)", text)
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_interview_questions(payload: Any, limit: int) -> list[dict]:
+    items = payload
+    if isinstance(payload, dict):
+        items = payload.get("questions")
+
+    if not isinstance(items, list):
+        raise RuntimeError("Questionnaire response missing 'questions' array")
+
+    normalized: list[dict] = []
+    for item in items:
+        question = ""
+        focus_area = "general"
+        difficulty = "medium"
+        reason = ""
+
+        if isinstance(item, str):
+            question = _clean_text(item)
+        elif isinstance(item, dict):
+            question = _clean_text(item.get("question"))
+            focus_area = _clean_text(item.get("focus_area")) or "general"
+            difficulty = _clean_text(item.get("difficulty")).lower() or "medium"
+            reason = _clean_text(item.get("reason") or item.get("reasoning"))
+
+        if not question:
+            continue
+        if difficulty not in {"easy", "medium", "hard"}:
+            difficulty = "medium"
+
+        normalized.append(
+            {
+                "question": question,
+                "focus_area": focus_area,
+                "difficulty": difficulty,
+                "reason": reason,
+            }
+        )
+        if len(normalized) >= limit:
+            break
+
+    if not normalized:
+        raise RuntimeError("Questionnaire generation returned no valid questions")
+    return normalized
+
+
+async def generate_interview_questions_async(
+    job: dict,
+    candidate: dict,
+    num_questions: int = 8,
+) -> list[dict]:
+    """Generate personalized interview questions for a ranked candidate."""
+
+    try:
+        count = int(num_questions)
+    except (TypeError, ValueError):
+        count = 8
+    count = max(3, min(20, count))
+
+    prompt = f"""You are a senior technical interviewer.
+Generate {count} personalized interview questions for this candidate and role.
+
+Use these signals together:
+- Skill overlap between job requirements and candidate profile (test depth)
+- Candidate experience level (adjust difficulty)
+- Candidate projects/work evidence from summary/resume text (practical understanding)
+- Gaps between candidate profile and job requirements (probe missing areas)
+
+Balance coverage across skill depth, projects, experience, and gaps.
+Questions must be specific and practical, not generic.
+
+Job:
+  Title: {_clean_text(job.get("title"))}
+  Description:
+\"\"\"
+{_clean_text(job.get("description"))[:6000]}
+\"\"\"
+  Required Skills: {_clean_text(job.get("skills"))}
+  Minimum Experience (years): {_clean_text(job.get("experience"))}
+
+Candidate:
+  Name: {_clean_text(candidate.get("name"))}
+  Experience: {_clean_text(candidate.get("total_experience"))}
+  Skills: {_clean_text(candidate.get("skills"))}
+  Summary:
+\"\"\"
+{_clean_text(candidate.get("summary"))[:1200]}
+\"\"\"
+  Resume Excerpt:
+\"\"\"
+{_clean_text(candidate.get("raw_text"))[:7000]}
+\"\"\"
+
+Return ONLY valid JSON with this exact shape:
+{{
+  "questions": [
+    {{
+      "question": "string",
+      "focus_area": "skills|projects|experience|gap|general",
+      "difficulty": "easy|medium|hard",
+      "reason": "short reason"
+    }}
+  ]
+}}"""
+
+    payload = await _chat_completion_json_async(
+        system_prompt="You create concise, role-specific interview questionnaires. Return only valid JSON.",
+        user_prompt=prompt,
+    )
+    return _normalize_interview_questions(payload, count)
+
+
+def generate_interview_questions_fallback(
+    job: dict,
+    candidate: dict,
+    num_questions: int = 8,
+) -> list[dict]:
+    """Deterministic fallback questionnaire when AI is unavailable."""
+
+    try:
+        count = int(num_questions)
+    except (TypeError, ValueError):
+        count = 8
+    count = max(3, min(20, count))
+
+    job_skills = _split_csv_like(job.get("skills"))
+    candidate_skills = _split_csv_like(candidate.get("skills"))
+    candidate_skill_map = {skill.lower(): skill for skill in candidate_skills}
+    job_skill_keys = {skill.lower() for skill in job_skills}
+
+    matched_skills = [
+        candidate_skill_map[key]
+        for key in candidate_skill_map
+        if key in job_skill_keys
+    ]
+    missing_skills = [
+        skill for skill in job_skills if skill.lower() not in candidate_skill_map
+    ]
+
+    candidate_years = _extract_years(candidate.get("total_experience"))
+    min_years = _extract_years(job.get("experience"))
+    if candidate_years >= max(7, min_years + 3):
+        base_difficulty = "hard"
+    elif candidate_years >= max(3, min_years):
+        base_difficulty = "medium"
+    else:
+        base_difficulty = "easy"
+
+    summary_text = _clean_text(candidate.get("summary"))
+    if not summary_text:
+        summary_text = _clean_text(candidate.get("raw_text"))[:350]
+    project_hint = summary_text.split(".")[0].strip() if summary_text else ""
+
+    questions: list[dict] = []
+
+    for skill in matched_skills[:3]:
+        questions.append(
+            {
+                "question": (
+                    f"You list {skill} in your profile. Describe a real problem you solved "
+                    f"with {skill}, your approach, tradeoffs, and measurable outcome."
+                ),
+                "focus_area": "skills",
+                "difficulty": base_difficulty,
+                "reason": f"Depth check on matched skill: {skill}.",
+            }
+        )
+
+    if project_hint:
+        questions.append(
+            {
+                "question": (
+                    "Walk through one relevant project from your resume. Explain your role, "
+                    "architecture decisions, challenges, and what you would improve now."
+                ),
+                "focus_area": "projects",
+                "difficulty": base_difficulty,
+                "reason": "Assess practical understanding from prior project work.",
+            }
+        )
+
+    if min_years > 0:
+        questions.append(
+            {
+                "question": (
+                    f"This role expects around {min_years:g}+ years of experience. "
+                    "Which responsibilities at that level have you already handled end-to-end?"
+                ),
+                "focus_area": "experience",
+                "difficulty": base_difficulty,
+                "reason": "Verify experience level against job expectations.",
+            }
+        )
+
+    for skill in missing_skills[:2]:
+        questions.append(
+            {
+                "question": (
+                    f"The role needs {skill}. You have limited evidence of it in your profile. "
+                    f"How would you ramp up quickly and deliver production work using {skill}?"
+                ),
+                "focus_area": "gap",
+                "difficulty": "medium",
+                "reason": f"Explore skill gap area: {skill}.",
+            }
+        )
+
+    if not questions:
+        questions.append(
+            {
+                "question": (
+                    "Choose one technically challenging task from your recent experience and "
+                    "explain your problem-solving process and outcomes."
+                ),
+                "focus_area": "general",
+                "difficulty": base_difficulty,
+                "reason": "Baseline technical depth assessment.",
+            }
+        )
+
+    while len(questions) < count:
+        topic = matched_skills[0] if matched_skills else (_clean_text(job.get("title")) or "this role")
+        questions.append(
+            {
+                "question": (
+                    f"What risks do you usually watch for when delivering {topic}-related work, "
+                    "and how do you mitigate them early?"
+                ),
+                "focus_area": "general",
+                "difficulty": "medium",
+                "reason": "Fill questionnaire with role-relevant practical assessment.",
+            }
+        )
+
+    return questions[:count]
