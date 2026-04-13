@@ -80,6 +80,22 @@ def create_tables():
         CREATE INDEX IF NOT EXISTS idx_questionnaires_candidate_order
         ON candidate_questionnaires(candidate_id, question_order)
     """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_candidates_job
+        ON candidates(job_id)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_candidates_job_rank
+        ON candidates(job_id, rank)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_candidates_job_scores
+        ON candidates(job_id, total_score DESC, semantic_score DESC)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_questionnaires_job_candidate_order
+        ON candidate_questionnaires(job_id, candidate_id, question_order)
+    """)
 
     # Backfill schema changes for existing databases.
     _ensure_column(conn, "jobs", "skills TEXT NOT NULL DEFAULT ''")

@@ -1,5 +1,7 @@
 import io
+import asyncio
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -18,6 +20,9 @@ from config import (
     EXPORT_DIR,
     MAX_UPLOAD_SIZE_BYTES,
     PROJECTS_SCORE_WEIGHT,
+    QUESTIONNAIRE_CONCURRENCY,
+    RANKING_CONCURRENCY,
+    RESUME_PROCESSING_CONCURRENCY,
     SKILL_SCORE_WEIGHT,
     UPLOAD_DIR,
     UPLOAD_MAX_SIZE_MB,
@@ -30,6 +35,8 @@ from services.ai_service import (
     combine_component_scores,
     extract_candidate_info_async,
     extract_candidate_info_fallback,
+    generate_interview_questions_by_topic_async,
+    generate_interview_questions_by_topic_fallback,
     generate_interview_questions_async,
     generate_interview_questions_fallback,
     get_embedding,
@@ -41,6 +48,7 @@ from services.resume_parser import extract_text
 # ── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="AI Recruitment Module", version="1.0.0")
+logger = logging.getLogger(__name__)
 
 
 @app.on_event("startup")
@@ -67,6 +75,24 @@ class JobOut(BaseModel):
     skills: str
     experience: int
     created_at: str | None = None
+
+
+class TopicQuestionPlan(BaseModel):
+    top_n: int = Field(default=5, ge=1, le=50)
+    skills: int = Field(default=3, ge=0, le=20)
+    dsa: int = Field(default=2, ge=0, le=20)
+    oop: int = Field(default=1, ge=0, le=20)
+    system_design: int = Field(default=1, ge=0, le=20)
+    projects: int = Field(default=2, ge=0, le=20)
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "skills": self.skills,
+            "dsa": self.dsa,
+            "oop": self.oop,
+            "system_design": self.system_design,
+            "projects": self.projects,
+        }
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -119,14 +145,8 @@ def _clamp_score(value: object, default: float = 0.0) -> float:
     return round(max(0.0, min(100.0, parsed)), 2)
 
 
-async def _process_single_resume(
-    cur: sqlite3.Cursor,
-    conn: sqlite3.Connection,
-    job_id: int,
-    data: bytes,
-    filename: str,
-) -> dict:
-    """Extract text → call AI → persist candidate row. Returns summary dict."""
+async def _extract_resume_details(data: bytes, filename: str) -> dict:
+    """Extract text and candidate details from one resume payload."""
 
     raw_text = await run_in_threadpool(extract_text, data, filename)
     if not raw_text or len(raw_text) < 50:
@@ -140,6 +160,7 @@ async def _process_single_resume(
         info = extract_candidate_info_fallback(raw_text)
         parser_mode = "heuristic"
         parser_warning = f"AI extraction failed, heuristic parser used: {exc}"
+        logger.warning("AI extraction failed for '%s'; using heuristic parser: %s", filename, exc)
 
     if not (info.get("name") or "").strip():
         stem = os.path.splitext(filename)[0]
@@ -163,9 +184,31 @@ async def _process_single_resume(
             get_embedding, embedding_text, is_query=False
         )
         embedding_json = _embedding_to_db(cand_embedding)
-    except Exception:
-        embedding_json = None
+    except Exception as exc:
+        logger.warning("Embedding generation failed for '%s': %s", filename, exc)
 
+    return {
+        "file": filename,
+        "raw_text": raw_text,
+        "embedding_json": embedding_json,
+        "name": info.get("name", ""),
+        "email": info.get("email") or "",
+        "phone": info.get("phone") or "",
+        "total_experience": info.get("total_experience", ""),
+        "skills": info.get("skills", ""),
+        "education": info.get("education", ""),
+        "certifications": info.get("certifications", ""),
+        "summary": info.get("summary", ""),
+        "parser_mode": parser_mode,
+        "warning": parser_warning,
+    }
+
+
+def _insert_candidate_record(
+    cur: sqlite3.Cursor,
+    job_id: int,
+    parsed_resume: dict,
+) -> int:
     cur.execute(
         """
         INSERT INTO candidates
@@ -175,29 +218,44 @@ async def _process_single_resume(
         """,
         (
             job_id,
-            filename,
-            raw_text,
-            embedding_json,
-            info.get("name", ""),
-            info.get("email") or "",
-            info.get("phone") or "",
-            info.get("total_experience", ""),
-            info.get("skills", ""),
-            info.get("education", ""),
-            info.get("certifications", ""),
-            info.get("summary", ""),
+            parsed_resume["file"],
+            parsed_resume["raw_text"],
+            parsed_resume["embedding_json"],
+            parsed_resume["name"],
+            parsed_resume["email"],
+            parsed_resume["phone"],
+            parsed_resume["total_experience"],
+            parsed_resume["skills"],
+            parsed_resume["education"],
+            parsed_resume["certifications"],
+            parsed_resume["summary"],
         ),
     )
-    conn.commit()
+    return cur.lastrowid
 
+
+async def _process_single_resume(
+    cur: sqlite3.Cursor,
+    conn: sqlite3.Connection,
+    job_id: int,
+    data: bytes,
+    filename: str,
+) -> dict:
+    """Extract text → call AI → persist candidate row. Returns summary dict."""
+    parsed = await _extract_resume_details(data, filename)
+    if "error" in parsed:
+        return parsed
+
+    candidate_id = _insert_candidate_record(cur, job_id, parsed)
+    conn.commit()
     return {
-        "id": cur.lastrowid,
-        "file": filename,
-        "name": info.get("name", ""),
-        "email": info.get("email", ""),
-        "skills": info.get("skills", ""),
-        "parser_mode": parser_mode,
-        "warning": parser_warning,
+        "id": candidate_id,
+        "file": parsed["file"],
+        "name": parsed["name"],
+        "email": parsed["email"],
+        "skills": parsed["skills"],
+        "parser_mode": parsed["parser_mode"],
+        "warning": parsed["warning"],
     }
 
 
@@ -212,7 +270,8 @@ def create_job(body: JobCreate, db: sqlite3.Connection = Depends(get_db)):
             body.title, body.description, body.skills, body.experience
         )
         embedding_json = _embedding_to_db(get_embedding(embedding_text, is_query=True))
-    except Exception:
+    except Exception as exc:
+        logger.warning("Job embedding generation failed for title '%s': %s", body.title, exc)
         embedding_json = None
 
     cur = db.cursor()
@@ -277,6 +336,7 @@ async def upload_resumes(
     cur = db.cursor()
     processed: list[dict] = []
     errors: list[dict] = []
+    pending_resumes: list[tuple[str, bytes]] = []
 
     for upload in files:
         fname = upload.filename or "unknown"
@@ -306,11 +366,7 @@ async def upload_resumes(
                             )
                             continue
 
-                        entry_data = zf.read(info)
-                        result = await _process_single_resume(
-                            cur, db, job_id, entry_data, os.path.basename(entry)
-                        )
-                        (errors if "error" in result else processed).append(result)
+                        pending_resumes.append((os.path.basename(entry), zf.read(info)))
             except zipfile.BadZipFile:
                 errors.append({"file": fname, "error": "Invalid ZIP file"})
             continue
@@ -320,8 +376,52 @@ async def upload_resumes(
             errors.append({"file": fname, "error": "Unsupported file type"})
             continue
 
-        result = await _process_single_resume(cur, db, job_id, raw, fname)
-        (errors if "error" in result else processed).append(result)
+        pending_resumes.append((fname, raw))
+
+    async def _extract_with_limit(filename: str, data: bytes, semaphore: asyncio.Semaphore) -> dict:
+        async with semaphore:
+            return await _extract_resume_details(data, filename)
+
+    if pending_resumes:
+        extract_semaphore = asyncio.Semaphore(RESUME_PROCESSING_CONCURRENCY)
+        extracted_resumes = await asyncio.gather(
+            *[
+                _extract_with_limit(filename, data, extract_semaphore)
+                for filename, data in pending_resumes
+            ]
+        )
+
+        for parsed in extracted_resumes:
+            if "error" in parsed:
+                errors.append({"file": parsed.get("file", "unknown"), "error": parsed["error"]})
+                continue
+
+            try:
+                candidate_id = _insert_candidate_record(cur, job_id, parsed)
+            except Exception as exc:
+                logger.exception("Failed to save parsed resume '%s': %s", parsed.get("file"), exc)
+                errors.append(
+                    {
+                        "file": parsed.get("file", "unknown"),
+                        "error": f"Failed to store candidate record: {exc}",
+                    }
+                )
+                continue
+
+            processed.append(
+                {
+                    "id": candidate_id,
+                    "file": parsed["file"],
+                    "name": parsed["name"],
+                    "email": parsed["email"],
+                    "skills": parsed["skills"],
+                    "parser_mode": parsed["parser_mode"],
+                    "warning": parsed["warning"],
+                }
+            )
+
+        if processed:
+            db.commit()
 
     return {
         "message": f"Processed {len(processed)} resume(s)",
@@ -331,6 +431,123 @@ async def upload_resumes(
 
 
 # ── Ranking ─────────────────────────────────────────────────────────────────
+
+
+async def _score_candidate_for_job(
+    candidate: dict,
+    job: dict,
+    job_embedding: list[float],
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    async with semaphore:
+        try:
+            cand_embedding = _embedding_from_db(candidate.get("embedding"))
+            embedding_json = None
+            if not cand_embedding:
+                cand_text = build_candidate_embedding_text(candidate)
+                cand_embedding = await run_in_threadpool(
+                    get_embedding, cand_text, is_query=False
+                )
+                embedding_json = _embedding_to_db(cand_embedding)
+
+            semantic = round(semantic_score(job_embedding, cand_embedding), 2)
+            skill_score = _clamp_score(candidate.get("skill_score"))
+            projects_score = _clamp_score(candidate.get("projects_score"))
+            experience_score = _clamp_score(candidate.get("experience_score"))
+            total_score = _clamp_score(
+                candidate.get("total_score"),
+                _to_float(candidate.get("score")),
+            )
+            if total_score <= 0 and any(
+                score > 0 for score in (skill_score, projects_score, experience_score)
+            ):
+                total_score = combine_component_scores(
+                    skill_score,
+                    projects_score,
+                    experience_score,
+                    skill_weight=SKILL_SCORE_WEIGHT,
+                    projects_weight=PROJECTS_SCORE_WEIGHT,
+                    experience_weight=EXPERIENCE_SCORE_WEIGHT,
+                )
+            had_prior_scores = any(
+                score > 0
+                for score in (skill_score, projects_score, experience_score, total_score)
+            )
+            needs_review = 0
+            review_reason: str | None = None
+            reasoning = "Component-based ranking generated from LLM evaluation."
+
+            if USE_LLM_IN_RANKING:
+                try:
+                    ai = await score_candidate_async(
+                        job.get("description", ""),
+                        job.get("skills", ""),
+                        job.get("experience", 0),
+                        candidate,
+                    )
+                    skill_score = _clamp_score(ai.get("skill_score"))
+                    projects_score = _clamp_score(ai.get("projects_score"))
+                    experience_score = _clamp_score(ai.get("experience_score"))
+                    total_score = combine_component_scores(
+                        skill_score,
+                        projects_score,
+                        experience_score,
+                        skill_weight=SKILL_SCORE_WEIGHT,
+                        projects_weight=PROJECTS_SCORE_WEIGHT,
+                        experience_weight=EXPERIENCE_SCORE_WEIGHT,
+                    )
+                    llm_reasoning = ai.get("reasoning", "")
+                    if llm_reasoning:
+                        reasoning = llm_reasoning
+                    needs_review = 0
+                    review_reason = None
+                except Exception as llm_exc:
+                    logger.warning(
+                        "LLM component scoring failed for candidate '%s': %s",
+                        candidate.get("id"),
+                        llm_exc,
+                    )
+                    if not had_prior_scores:
+                        skill_score = 0.0
+                        projects_score = 0.0
+                        experience_score = 0.0
+                        total_score = 0.0
+                    needs_review = 1
+                    review_reason = f"LLM component scoring failed: {llm_exc}"
+                    if had_prior_scores:
+                        reasoning = (
+                            "Candidate flagged for manual review because LLM component "
+                            "scoring failed. Existing scores were preserved."
+                        )
+                    else:
+                        reasoning = (
+                            "Candidate flagged for manual review because LLM component "
+                            "scoring failed before component scores were available."
+                        )
+            else:
+                needs_review = 1
+                review_reason = "LLM component scoring is disabled by configuration."
+                reasoning = (
+                    "Candidate flagged for manual review because LLM component scoring "
+                    "is disabled."
+                )
+
+            return {
+                "id": candidate["id"],
+                "name": candidate.get("name", ""),
+                "embedding_json": embedding_json,
+                "semantic_score": semantic,
+                "skill_score": skill_score,
+                "projects_score": projects_score,
+                "experience_score": experience_score,
+                "total_score": total_score,
+                "score": total_score,
+                "needs_review": bool(needs_review),
+                "review_reason": review_reason,
+                "reasoning": reasoning,
+            }
+        except Exception as exc:
+            return {"id": candidate["id"], "name": candidate.get("name", ""), "error": str(exc)}
 
 
 @app.post("/jobs/{job_id}/rank-candidates/", tags=["Ranking"])
@@ -367,131 +584,26 @@ async def rank_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db))
         except Exception as exc:
             raise HTTPException(500, f"Failed to generate job embedding: {exc}")
 
-    for cand in candidates:
-        c = dict(cand)
-
-        try:
-            cand_embedding = _embedding_from_db(c.get("embedding"))
-            if not cand_embedding:
-                cand_text = build_candidate_embedding_text(c)
-                cand_embedding = await run_in_threadpool(
-                    get_embedding, cand_text, is_query=False
-                )
-                cur.execute(
-                    "UPDATE candidates SET embedding = ? WHERE id = ?",
-                    (_embedding_to_db(cand_embedding), c["id"]),
-                )
-
-            semantic = round(semantic_score(job_embedding, cand_embedding), 2)
-            skill_score = _clamp_score(c.get("skill_score"))
-            projects_score = _clamp_score(c.get("projects_score"))
-            experience_score = _clamp_score(c.get("experience_score"))
-            total_score = _clamp_score(c.get("total_score"), _to_float(c.get("score")))
-            if total_score <= 0 and any(
-                score > 0 for score in (skill_score, projects_score, experience_score)
-            ):
-                total_score = combine_component_scores(
-                    skill_score,
-                    projects_score,
-                    experience_score,
-                    skill_weight=SKILL_SCORE_WEIGHT,
-                    projects_weight=PROJECTS_SCORE_WEIGHT,
-                    experience_weight=EXPERIENCE_SCORE_WEIGHT,
-                )
-            had_prior_scores = any(
-                score > 0
-                for score in (skill_score, projects_score, experience_score, total_score)
+    job_data = dict(job)
+    candidate_rows = [dict(row) for row in candidates]
+    ranking_semaphore = asyncio.Semaphore(RANKING_CONCURRENCY)
+    scored_candidates = await asyncio.gather(
+        *[
+            _score_candidate_for_job(
+                candidate,
+                job_data,
+                job_embedding,
+                ranking_semaphore,
             )
-            needs_review = 0
-            review_reason: str | None = None
-            reasoning = "Component-based ranking generated from LLM evaluation."
+            for candidate in candidate_rows
+        ]
+    )
 
-            if USE_LLM_IN_RANKING:
-                try:
-                    ai = await score_candidate_async(
-                        job["description"],
-                        job["skills"] if "skills" in job.keys() else "",
-                        job["experience"] if "experience" in job.keys() else 0,
-                        c,
-                    )
-                    skill_score = _clamp_score(ai.get("skill_score"))
-                    projects_score = _clamp_score(ai.get("projects_score"))
-                    experience_score = _clamp_score(ai.get("experience_score"))
-                    total_score = combine_component_scores(
-                        skill_score,
-                        projects_score,
-                        experience_score,
-                        skill_weight=SKILL_SCORE_WEIGHT,
-                        projects_weight=PROJECTS_SCORE_WEIGHT,
-                        experience_weight=EXPERIENCE_SCORE_WEIGHT,
-                    )
-                    llm_reasoning = ai.get("reasoning", "")
-                    if llm_reasoning:
-                        reasoning = llm_reasoning
-                    needs_review = 0
-                    review_reason = None
-                except Exception as llm_exc:
-                    if not had_prior_scores:
-                        skill_score = 0.0
-                        projects_score = 0.0
-                        experience_score = 0.0
-                        total_score = 0.0
-                    needs_review = 1
-                    review_reason = f"LLM component scoring failed: {llm_exc}"
-                    if had_prior_scores:
-                        reasoning = (
-                            "Candidate flagged for manual review because LLM component "
-                            "scoring failed. Existing scores were preserved."
-                        )
-                    else:
-                        reasoning = (
-                            "Candidate flagged for manual review because LLM component "
-                            "scoring failed before component scores were available."
-                        )
-            else:
-                needs_review = 1
-                review_reason = "LLM component scoring is disabled by configuration."
-                reasoning = (
-                    "Candidate flagged for manual review because LLM component scoring "
-                    "is disabled."
-                )
-
-            cur.execute(
-                """UPDATE candidates
-                   SET semantic_score = ?, skill_score = ?, projects_score = ?,
-                       experience_score = ?, total_score = ?, score = ?,
-                       score_reasoning = ?, needs_review = ?, review_reason = ?
-                   WHERE id = ?""",
-                (
-                    semantic,
-                    skill_score,
-                    projects_score,
-                    experience_score,
-                    total_score,
-                    total_score,  # Backward-compat alias for existing clients.
-                    reasoning,
-                    needs_review,
-                    review_reason,
-                    c["id"],
-                ),
-            )
-            results.append(
-                {
-                    "id": c["id"],
-                    "name": c["name"],
-                    "semantic_score": semantic,
-                    "skill_score": skill_score,
-                    "projects_score": projects_score,
-                    "experience_score": experience_score,
-                    "total_score": total_score,
-                    "score": total_score,
-                    "needs_review": bool(needs_review),
-                    "review_reason": review_reason,
-                    "reasoning": reasoning,
-                }
-            )
-        except Exception as exc:
-            err = str(exc)
+    for ranked in scored_candidates:
+        candidate_id = ranked["id"]
+        candidate_name = ranked.get("name", "")
+        if "error" in ranked:
+            err = ranked["error"]
             cur.execute(
                 """UPDATE candidates
                    SET semantic_score = 0, skill_score = 0, projects_score = 0,
@@ -501,10 +613,52 @@ async def rank_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db))
                 (
                     f"Ranking failed: {err}",
                     f"Ranking pipeline failed: {err}",
-                    c["id"],
+                    candidate_id,
                 ),
             )
-            results.append({"id": c["id"], "name": c["name"], "error": err})
+            results.append({"id": candidate_id, "name": candidate_name, "error": err})
+            continue
+
+        if ranked.get("embedding_json"):
+            cur.execute(
+                "UPDATE candidates SET embedding = ? WHERE id = ?",
+                (ranked["embedding_json"], candidate_id),
+            )
+
+        cur.execute(
+            """UPDATE candidates
+               SET semantic_score = ?, skill_score = ?, projects_score = ?,
+                   experience_score = ?, total_score = ?, score = ?,
+                   score_reasoning = ?, needs_review = ?, review_reason = ?
+               WHERE id = ?""",
+            (
+                ranked["semantic_score"],
+                ranked["skill_score"],
+                ranked["projects_score"],
+                ranked["experience_score"],
+                ranked["total_score"],
+                ranked["score"],  # Backward-compat alias for existing clients.
+                ranked["reasoning"],
+                int(ranked["needs_review"]),
+                ranked["review_reason"],
+                candidate_id,
+            ),
+        )
+        results.append(
+            {
+                "id": candidate_id,
+                "name": candidate_name,
+                "semantic_score": ranked["semantic_score"],
+                "skill_score": ranked["skill_score"],
+                "projects_score": ranked["projects_score"],
+                "experience_score": ranked["experience_score"],
+                "total_score": ranked["total_score"],
+                "score": ranked["score"],
+                "needs_review": ranked["needs_review"],
+                "review_reason": ranked["review_reason"],
+                "reasoning": ranked["reasoning"],
+            }
+        )
 
     # assign ranks (1 = best)
     ranked_ids = db.execute(
@@ -530,6 +684,92 @@ async def rank_candidates(job_id: int, db: sqlite3.Connection = Depends(get_db))
 
 
 # ── Interview Questionnaires ────────────────────────────────────────────────
+
+
+async def _build_questionnaire_for_candidate(
+    job: dict,
+    candidate: dict,
+    questions_per_candidate: int,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    async with semaphore:
+        generation_mode = "ai"
+        warning: str | None = None
+
+        try:
+            questions = await generate_interview_questions_async(
+                job,
+                candidate,
+                questions_per_candidate,
+            )
+        except Exception as exc:
+            questions = generate_interview_questions_fallback(
+                job,
+                candidate,
+                questions_per_candidate,
+            )
+            generation_mode = "fallback"
+            warning = f"AI questionnaire generation failed, fallback used: {exc}"
+            logger.warning(
+                "AI questionnaire generation failed for candidate '%s': %s",
+                candidate.get("id"),
+                exc,
+            )
+
+        return {
+            "candidate_id": candidate["id"],
+            "name": candidate.get("name", ""),
+            "rank": candidate.get("rank", 0),
+            "total_score": candidate.get("total_score", 0),
+            "needs_review": bool(candidate.get("needs_review", 0)),
+            "generation_mode": generation_mode,
+            "warning": warning,
+            "questions_count": len(questions),
+            "questions": questions,
+        }
+
+
+async def _build_topic_questionnaire_for_candidate(
+    job: dict,
+    candidate: dict,
+    topic_counts: dict[str, int],
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    async with semaphore:
+        generation_mode = "ai"
+        warning: str | None = None
+
+        try:
+            questions = await generate_interview_questions_by_topic_async(
+                job,
+                candidate,
+                topic_counts,
+            )
+        except Exception as exc:
+            questions = generate_interview_questions_by_topic_fallback(
+                job,
+                candidate,
+                topic_counts,
+            )
+            generation_mode = "fallback"
+            warning = f"AI topic questionnaire generation failed, fallback used: {exc}"
+            logger.warning(
+                "AI topic questionnaire generation failed for candidate '%s': %s",
+                candidate.get("id"),
+                exc,
+            )
+
+        return {
+            "candidate_id": candidate["id"],
+            "name": candidate.get("name", ""),
+            "rank": candidate.get("rank", 0),
+            "total_score": candidate.get("total_score", 0),
+            "needs_review": bool(candidate.get("needs_review", 0)),
+            "generation_mode": generation_mode,
+            "warning": warning,
+            "questions_count": len(questions),
+            "questions": questions,
+        }
 
 
 @app.post("/jobs/{job_id}/generate-questionnaires/", tags=["Interview"])
@@ -568,34 +808,26 @@ async def generate_questionnaires(
         raise HTTPException(404, "No ranked candidates available")
 
     cur = db.cursor()
-    generated: list[dict] = []
     job = dict(job_row)
-
-    for candidate_row in top_rows:
-        candidate = dict(candidate_row)
-        generation_mode = "ai"
-        warning: str | None = None
-
-        try:
-            questions = await generate_interview_questions_async(
+    questionnaire_semaphore = asyncio.Semaphore(QUESTIONNAIRE_CONCURRENCY)
+    generated = await asyncio.gather(
+        *[
+            _build_questionnaire_for_candidate(
                 job,
-                candidate,
+                dict(candidate_row),
                 questions_per_candidate,
+                questionnaire_semaphore,
             )
-        except Exception as exc:
-            questions = generate_interview_questions_fallback(
-                job,
-                candidate,
-                questions_per_candidate,
-            )
-            generation_mode = "fallback"
-            warning = f"AI questionnaire generation failed, fallback used: {exc}"
+            for candidate_row in top_rows
+        ]
+    )
 
+    for item in generated:
         cur.execute(
             "DELETE FROM candidate_questionnaires WHERE candidate_id = ?",
-            (candidate["id"],),
+            (item["candidate_id"],),
         )
-        for idx, item in enumerate(questions, 1):
+        for idx, question in enumerate(item["questions"], 1):
             cur.execute(
                 """INSERT INTO candidate_questionnaires
                        (job_id, candidate_id, question_order, question_text, focus_area,
@@ -603,29 +835,15 @@ async def generate_questionnaires(
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job_id,
-                    candidate["id"],
+                    item["candidate_id"],
                     idx,
-                    item.get("question", "").strip(),
-                    item.get("focus_area", "general"),
-                    item.get("difficulty", "medium"),
-                    item.get("reason", ""),
-                    generation_mode,
+                    question.get("question", "").strip(),
+                    question.get("focus_area", "general"),
+                    question.get("difficulty", "medium"),
+                    question.get("reason", ""),
+                    item["generation_mode"],
                 ),
             )
-
-        generated.append(
-            {
-                "candidate_id": candidate["id"],
-                "name": candidate.get("name", ""),
-                "rank": candidate.get("rank", 0),
-                "total_score": candidate.get("total_score", 0),
-                "needs_review": bool(candidate.get("needs_review", 0)),
-                "generation_mode": generation_mode,
-                "warning": warning,
-                "questions_count": len(questions),
-                "questions": questions,
-            }
-        )
 
     db.commit()
     return {
@@ -633,6 +851,100 @@ async def generate_questionnaires(
         "job_id": job_id,
         "top_n": top_n,
         "questions_per_candidate": questions_per_candidate,
+        "candidates": generated,
+    }
+
+
+@app.post("/jobs/{job_id}/generate-questionnaires-by-topic/", tags=["Interview"])
+async def generate_questionnaires_by_topic(
+    job_id: int,
+    plan: TopicQuestionPlan,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Generate questionnaires with explicit topic distribution per candidate.
+    Topics: skills, dsa, oop, system_design, projects.
+    """
+
+    topic_counts = plan.counts()
+    total_questions = sum(topic_counts.values())
+    if total_questions <= 0:
+        raise HTTPException(
+            400,
+            "At least one topic count must be greater than zero.",
+        )
+
+    job_row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job_row:
+        raise HTTPException(404, "Job not found")
+
+    candidate_count = db.execute(
+        "SELECT COUNT(*) FROM candidates WHERE job_id = ?", (job_id,)
+    ).fetchone()[0]
+    if candidate_count == 0:
+        raise HTTPException(404, "No candidates found for this job")
+
+    ranked_count = db.execute(
+        "SELECT COUNT(*) FROM candidates WHERE job_id = ? AND rank > 0", (job_id,)
+    ).fetchone()[0]
+    if ranked_count == 0:
+        await rank_candidates(job_id, db)
+
+    top_rows = db.execute(
+        """SELECT * FROM candidates
+           WHERE job_id = ?
+           ORDER BY rank ASC, total_score DESC, semantic_score DESC
+           LIMIT ?""",
+        (job_id, plan.top_n),
+    ).fetchall()
+    if not top_rows:
+        raise HTTPException(404, "No ranked candidates available")
+
+    cur = db.cursor()
+    job = dict(job_row)
+    questionnaire_semaphore = asyncio.Semaphore(QUESTIONNAIRE_CONCURRENCY)
+    generated = await asyncio.gather(
+        *[
+            _build_topic_questionnaire_for_candidate(
+                job,
+                dict(candidate_row),
+                topic_counts,
+                questionnaire_semaphore,
+            )
+            for candidate_row in top_rows
+        ]
+    )
+
+    for item in generated:
+        cur.execute(
+            "DELETE FROM candidate_questionnaires WHERE candidate_id = ?",
+            (item["candidate_id"],),
+        )
+        for idx, question in enumerate(item["questions"], 1):
+            cur.execute(
+                """INSERT INTO candidate_questionnaires
+                       (job_id, candidate_id, question_order, question_text, focus_area,
+                        difficulty, reasoning, generation_mode)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job_id,
+                    item["candidate_id"],
+                    idx,
+                    question.get("question", "").strip(),
+                    question.get("focus_area", "general"),
+                    question.get("difficulty", "medium"),
+                    question.get("reason", ""),
+                    item["generation_mode"],
+                ),
+            )
+
+    db.commit()
+    return {
+        "message": f"Generated topic-based questionnaires for {len(generated)} candidate(s)",
+        "job_id": job_id,
+        "top_n": plan.top_n,
+        "question_plan": topic_counts,
+        "questions_per_candidate": total_questions,
         "candidates": generated,
     }
 

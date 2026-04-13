@@ -1,11 +1,14 @@
 import json
+import logging
+import os
 import re
 import time
 import asyncio
+import threading
 from functools import lru_cache
 from typing import Any
 
-from openai import AsyncOpenAI, OpenAI
+from openai import AsyncOpenAI, OpenAI, OpenAIError
 
 from config import (
     AI_MAX_RETRIES,
@@ -27,6 +30,10 @@ async_client = AsyncOpenAI(
     base_url=AZURE_OPENAI_ENDPOINT,
     api_key=AZURE_OPENAI_API_KEY,
 )
+logger = logging.getLogger(__name__)
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+_embedding_stack_lock = threading.Lock()
+_embedding_infer_lock = threading.Lock()
 
 
 def _clean_json(text: str) -> str:
@@ -39,25 +46,26 @@ def _clean_json(text: str) -> str:
 
 @lru_cache(maxsize=1)
 def _get_embedding_stack() -> tuple[Any, Any, Any]:
-    try:
-        import torch
-        import transformers.utils.import_utils as hf_import_utils
-        hf_import_utils._torchvision_available = False
-        from transformers import AutoModel, AutoTokenizer
-    except Exception as exc:
-        raise RuntimeError(
-            "Embedding dependencies missing. Install with: pip install transformers torch"
-        ) from exc
+    with _embedding_stack_lock:
+        try:
+            import torch
+            import transformers.utils.import_utils as hf_import_utils
+            hf_import_utils._torchvision_available = False
+            from transformers import AutoModel, AutoTokenizer
+        except Exception as exc:
+            raise RuntimeError(
+                "Embedding dependencies missing. Install with: pip install transformers torch"
+            ) from exc
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME)
-        model = AutoModel.from_pretrained(EMBEDDING_MODEL_NAME)
-        model.eval()
-        return tokenizer, model, torch
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to load embedding model '{EMBEDDING_MODEL_NAME}': {exc}"
-        ) from exc
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME)
+            model = AutoModel.from_pretrained(EMBEDDING_MODEL_NAME)
+            model.eval()
+            return tokenizer, model, torch
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load embedding model '{EMBEDDING_MODEL_NAME}': {exc}"
+            ) from exc
 
 
 def _clean_text(value: Any) -> str:
@@ -248,26 +256,41 @@ def get_embedding(text: str, *, is_query: bool) -> list[float]:
     if not clean:
         return []
 
-    prefix = "query: " if is_query else "passage: "
     tokenizer, model, torch = _get_embedding_stack()
-    encoded = tokenizer(
-        prefix + clean,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-        padding=True,
-    )
+    prefix = "query: " if is_query else "passage: "
 
-    with torch.no_grad():
-        output = model(**encoded)
-        token_embeddings = output.last_hidden_state
-        mask = encoded["attention_mask"].unsqueeze(-1).expand(token_embeddings.size()).float()
-        summed = (token_embeddings * mask).sum(dim=1)
-        counts = mask.sum(dim=1).clamp(min=1e-9)
-        pooled = summed / counts
-        normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
+    with _embedding_infer_lock:
+        encoded = tokenizer(
+            prefix + clean,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True,
+        )
+        model_device = next(model.parameters()).device
+        encoded = {key: value.to(model_device) for key, value in encoded.items()}
 
-    return normalized[0].cpu().tolist()
+        with torch.no_grad():
+            output = model(**encoded)
+            token_embeddings = output.last_hidden_state
+            if token_embeddings.device.type == "meta":
+                raise RuntimeError(
+                    "Embedding model returned meta tensors. Restart the app to reinitialize the model."
+                )
+
+            mask = (
+                encoded["attention_mask"]
+                .to(token_embeddings.device)
+                .unsqueeze(-1)
+                .expand(token_embeddings.size())
+                .float()
+            )
+            summed = (token_embeddings * mask).sum(dim=1)
+            counts = mask.sum(dim=1).clamp(min=1e-9)
+            pooled = summed / counts
+            normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
+
+        return normalized[0].detach().cpu().tolist()
 
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
@@ -352,8 +375,14 @@ def _chat_completion_json(system_prompt: str, user_prompt: str) -> dict:
             )
             content = resp.choices[0].message.content or ""
             return json.loads(_clean_json(content))
-        except Exception as exc:
+        except (OpenAIError, json.JSONDecodeError, ValueError) as exc:
             last_error = exc
+            logger.warning(
+                "AI sync request attempt %s/%s failed: %s",
+                attempt,
+                AI_MAX_RETRIES,
+                exc,
+            )
             if attempt == AI_MAX_RETRIES:
                 break
             time.sleep(AI_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
@@ -384,8 +413,14 @@ async def _chat_completion_json_async(system_prompt: str, user_prompt: str) -> d
             )
             content = resp.choices[0].message.content or ""
             return json.loads(_clean_json(content))
-        except Exception as exc:
+        except (OpenAIError, json.JSONDecodeError, ValueError) as exc:
             last_error = exc
+            logger.warning(
+                "AI async request attempt %s/%s failed: %s",
+                attempt,
+                AI_MAX_RETRIES,
+                exc,
+            )
             if attempt == AI_MAX_RETRIES:
                 break
             await asyncio.sleep(AI_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
@@ -808,3 +843,247 @@ def generate_interview_questions_fallback(
         )
 
     return questions[:count]
+
+
+_TOPIC_KEYS = ("skills", "dsa", "oop", "system_design", "projects")
+
+
+def _normalize_focus_area(value: Any) -> str:
+    raw = _clean_text(value).lower().replace("-", "_").replace(" ", "_")
+    mapping = {
+        "skills": "skills",
+        "skill": "skills",
+        "dsa": "dsa",
+        "algorithms": "dsa",
+        "algorithm": "dsa",
+        "data_structures": "dsa",
+        "oop": "oop",
+        "object_oriented": "oop",
+        "object_oriented_programming": "oop",
+        "system_design": "system_design",
+        "systemdesign": "system_design",
+        "system": "system_design",
+        "projects": "projects",
+        "project": "projects",
+    }
+    return mapping.get(raw, "")
+
+
+def _sanitize_topic_counts(topic_counts: dict[str, Any]) -> dict[str, int]:
+    clean: dict[str, int] = {}
+    for topic in _TOPIC_KEYS:
+        value = topic_counts.get(topic, 0)
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            count = 0
+        clean[topic] = max(0, min(20, count))
+    return clean
+
+
+def _topic_fallback_questions_for_area(
+    area: str,
+    count: int,
+    job: dict,
+    candidate: dict,
+    difficulty: str,
+) -> list[dict]:
+    if count <= 0:
+        return []
+
+    job_title = _clean_text(job.get("title")) or "this role"
+    job_skills = _split_csv_like(job.get("skills"))
+    cand_skills = _split_csv_like(candidate.get("skills"))
+    overlap = [skill for skill in job_skills if skill.lower() in {s.lower() for s in cand_skills}]
+    primary_skill = overlap[0] if overlap else (job_skills[0] if job_skills else "core technologies")
+    project_hint = _clean_text(candidate.get("summary")).split(".")[0].strip() or "one relevant project"
+
+    templates: dict[str, list[str]] = {
+        "skills": [
+            f"For {primary_skill}, explain a production issue you solved, your debugging path, and measurable impact.",
+            f"How would you validate code quality and reliability when shipping a feature in {primary_skill}?",
+            f"Describe tradeoffs you consider when choosing libraries/tools around {primary_skill}.",
+        ],
+        "dsa": [
+            "Design an efficient approach for finding top-k frequent items in a large stream. Explain complexity and tradeoffs.",
+            "How would you choose between hash map, heap, and sorting for ranking-heavy workloads?",
+            "Given a large dataset with frequent updates, what data structure would you use for fast search and why?",
+        ],
+        "oop": [
+            "How do you apply SOLID principles in a backend module while keeping it easy to test and extend?",
+            "Show how you would refactor a tightly coupled class into clearer interfaces and responsibilities.",
+            "When would you prefer composition over inheritance in production code? Give a concrete example.",
+        ],
+        "system_design": [
+            f"Design a scalable architecture for {job_title}. Cover APIs, storage, caching, and failure handling.",
+            "How would you design observability (logs, metrics, traces) for a high-throughput service?",
+            "Explain how you would scale read-heavy traffic while preserving consistency requirements.",
+        ],
+        "projects": [
+            f"Walk through {project_hint}. What was your ownership, key decisions, and outcomes?",
+            "Describe a project decision you made under uncertainty and how you validated it in production.",
+            "If you revisit your most relevant project today, what would you redesign first and why?",
+        ],
+    }
+
+    prompts = templates.get(area, ["Describe your approach to solving a complex technical task."])
+    items: list[dict] = []
+    for idx in range(count):
+        question = prompts[idx % len(prompts)]
+        items.append(
+            {
+                "question": question,
+                "focus_area": area,
+                "difficulty": difficulty,
+                "reason": f"Fallback {area} question to satisfy requested distribution.",
+            }
+        )
+    return items
+
+
+def _ensure_topic_distribution(
+    questions: list[dict],
+    topic_counts: dict[str, int],
+    job: dict,
+    candidate: dict,
+) -> list[dict]:
+    candidate_years = _extract_years(candidate.get("total_experience"))
+    min_years = _extract_years(job.get("experience"))
+    if candidate_years >= max(7, min_years + 3):
+        difficulty = "hard"
+    elif candidate_years >= max(3, min_years):
+        difficulty = "medium"
+    else:
+        difficulty = "easy"
+
+    buckets: dict[str, list[dict]] = {topic: [] for topic in _TOPIC_KEYS}
+    for item in questions:
+        area = _normalize_focus_area(item.get("focus_area"))
+        if not area:
+            continue
+        buckets[area].append(
+            {
+                "question": _clean_text(item.get("question")),
+                "focus_area": area,
+                "difficulty": _clean_text(item.get("difficulty")).lower() or "medium",
+                "reason": _clean_text(item.get("reason") or item.get("reasoning")),
+            }
+        )
+
+    ordered: list[dict] = []
+    for topic in _TOPIC_KEYS:
+        required = topic_counts.get(topic, 0)
+        if required <= 0:
+            continue
+
+        selected: list[dict] = []
+        for item in buckets.get(topic, []):
+            if not item.get("question"):
+                continue
+            if item["difficulty"] not in {"easy", "medium", "hard"}:
+                item["difficulty"] = "medium"
+            selected.append(item)
+            if len(selected) >= required:
+                break
+
+        missing = required - len(selected)
+        if missing > 0:
+            selected.extend(
+                _topic_fallback_questions_for_area(
+                    topic,
+                    missing,
+                    job,
+                    candidate,
+                    difficulty,
+                )
+            )
+
+        ordered.extend(selected[:required])
+
+    if not ordered:
+        raise RuntimeError("Topic-based questionnaire generation returned no questions")
+
+    for idx, item in enumerate(ordered, 1):
+        item["order"] = idx
+    return ordered
+
+
+async def generate_interview_questions_by_topic_async(
+    job: dict,
+    candidate: dict,
+    topic_counts: dict[str, Any],
+) -> list[dict]:
+    clean_counts = _sanitize_topic_counts(topic_counts)
+    total = sum(clean_counts.values())
+    if total <= 0:
+        raise RuntimeError("At least one topic count must be greater than zero")
+
+    plan_lines = "\n".join(
+        f"- {topic}: {count}" for topic, count in clean_counts.items() if count > 0
+    )
+
+    prompt = f"""You are a senior technical interviewer.
+Generate interview questions for this candidate with the exact topic distribution below.
+
+Topic distribution (exact counts):
+{plan_lines}
+
+Rules:
+- Return exactly {total} questions in total.
+- Every question must include one focus area from: skills, dsa, oop, system_design, projects.
+- Questions must be role-relevant and practical.
+- Keep questions specific; avoid generic phrasing.
+
+Job:
+  Title: {_clean_text(job.get("title"))}
+  Description:
+\"\"\"
+{_clean_text(job.get("description"))[:6000]}
+\"\"\"
+  Required Skills: {_clean_text(job.get("skills"))}
+  Minimum Experience (years): {_clean_text(job.get("experience"))}
+
+Candidate:
+  Name: {_clean_text(candidate.get("name"))}
+  Experience: {_clean_text(candidate.get("total_experience"))}
+  Skills: {_clean_text(candidate.get("skills"))}
+  Summary:
+\"\"\"
+{_clean_text(candidate.get("summary"))[:1200]}
+\"\"\"
+  Resume Excerpt:
+\"\"\"
+{_clean_text(candidate.get("raw_text"))[:7000]}
+\"\"\"
+
+Return ONLY valid JSON:
+{{
+  "questions": [
+    {{
+      "question": "string",
+      "focus_area": "skills|dsa|oop|system_design|projects",
+      "difficulty": "easy|medium|hard",
+      "reason": "short reason"
+    }}
+  ]
+}}"""
+
+    payload = await _chat_completion_json_async(
+        system_prompt="You generate structured interview questions. Return only valid JSON.",
+        user_prompt=prompt,
+    )
+    normalized = _normalize_interview_questions(payload, total * 3)
+    return _ensure_topic_distribution(normalized, clean_counts, job, candidate)
+
+
+def generate_interview_questions_by_topic_fallback(
+    job: dict,
+    candidate: dict,
+    topic_counts: dict[str, Any],
+) -> list[dict]:
+    clean_counts = _sanitize_topic_counts(topic_counts)
+    total = sum(clean_counts.values())
+    if total <= 0:
+        raise RuntimeError("At least one topic count must be greater than zero")
+
+    return _ensure_topic_distribution([], clean_counts, job, candidate)
