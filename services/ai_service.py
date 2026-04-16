@@ -2,30 +2,23 @@ import json
 import logging
 import os
 import re
-import time
 import asyncio
 import threading
 from functools import lru_cache
 from typing import Any
 
-from openai import AsyncOpenAI, OpenAI, OpenAIError
+from openai import AsyncOpenAI, OpenAIError
 
 from config import (
     AI_MAX_RETRIES,
     AI_RETRY_BACKOFF_SECONDS,
     AI_TIMEOUT_SECONDS,
     EMBEDDING_MODEL_NAME,
-    LLM_SCORE_WEIGHT,
-    SEMANTIC_SCORE_WEIGHT,
     AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_MODEL,
 )
 
-client = OpenAI(
-    base_url=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_API_KEY,
-)
 async_client = AsyncOpenAI(
     base_url=AZURE_OPENAI_ENDPOINT,
     api_key=AZURE_OPENAI_API_KEY,
@@ -305,20 +298,6 @@ def semantic_score(vec_a: list[float], vec_b: list[float]) -> float:
     return max(0.0, min(100.0, cosine_similarity(vec_a, vec_b) * 100))
 
 
-def combine_scores(semantic: float, llm: float | None = None) -> float:
-    if llm is None:
-        return round(semantic, 2)
-
-    total_weight = SEMANTIC_SCORE_WEIGHT + LLM_SCORE_WEIGHT
-    if total_weight <= 0:
-        return round(semantic, 2)
-
-    blended = (
-        (semantic * SEMANTIC_SCORE_WEIGHT) + (llm * LLM_SCORE_WEIGHT)
-    ) / total_weight
-    return round(blended, 2)
-
-
 def combine_component_scores(
     skill_score: Any,
     projects_score: Any,
@@ -353,44 +332,6 @@ def combine_component_scores(
         (skill * w_skill) + (projects * w_projects) + (experience * w_experience)
     ) / total_weight
     return _coerce_score(blended)
-
-
-def _chat_completion_json(system_prompt: str, user_prompt: str) -> dict:
-    """Call AI with timeout/retry and parse JSON output."""
-    if not _clean_text(AZURE_OPENAI_API_KEY):
-        raise RuntimeError("AZURE_OPENAI_API_KEY is not set")
-
-    last_error = None
-
-    for attempt in range(1, AI_MAX_RETRIES + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=AZURE_OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                timeout=AI_TIMEOUT_SECONDS,
-            )
-            content = resp.choices[0].message.content or ""
-            return json.loads(_clean_json(content))
-        except (OpenAIError, json.JSONDecodeError, ValueError) as exc:
-            last_error = exc
-            logger.warning(
-                "AI sync request attempt %s/%s failed: %s",
-                attempt,
-                AI_MAX_RETRIES,
-                exc,
-            )
-            if attempt == AI_MAX_RETRIES:
-                break
-            time.sleep(AI_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-
-    err_type = type(last_error).__name__ if last_error else "UnknownError"
-    raise RuntimeError(
-        f"AI request failed after {AI_MAX_RETRIES} attempt(s): {err_type}: {last_error}"
-    ) from last_error
 
 
 async def _chat_completion_json_async(system_prompt: str, user_prompt: str) -> dict:
@@ -431,33 +372,6 @@ async def _chat_completion_json_async(system_prompt: str, user_prompt: str) -> d
     ) from last_error
 
 
-def extract_candidate_info(resume_text: str) -> dict:
-    """Use GPT to pull structured fields from raw resume text."""
-
-    prompt = f"""Extract the following information from this resume.
-Return a JSON object with exactly these keys:
-- "name"              : string (full name)
-- "email"             : string or null
-- "phone"             : string or null
-- "total_experience"  : string (e.g. "5 years"); estimate from work history if not stated
-- "skills"            : string, comma-separated list of key skills
-- "education"         : string, comma-separated degrees / institutions
-- "certifications"    : string, comma-separated or empty string
-- "summary"           : string, 2-3 sentence professional summary
-
-Resume:
-\"\"\"
-{resume_text[:12000]}
-\"\"\"
-
-Return ONLY the JSON object. No markdown, no explanation."""
-
-    return _chat_completion_json(
-        system_prompt="You are a resume-parsing assistant. Return only valid JSON.",
-        user_prompt=prompt,
-    )
-
-
 async def extract_candidate_info_async(resume_text: str) -> dict:
     """Async version: use GPT to pull structured fields from raw resume text."""
 
@@ -481,56 +395,6 @@ Return ONLY the JSON object. No markdown, no explanation."""
 
     return await _chat_completion_json_async(
         system_prompt="You are a resume-parsing assistant. Return only valid JSON.",
-        user_prompt=prompt,
-    )
-
-
-def score_candidate(
-    job_description: str,
-    job_skills: str,
-    min_experience: int | str,
-    candidate: dict,
-) -> dict:
-    """Return component scores (skills/projects/experience) for one candidate."""
-
-    prompt = f"""You are an expert HR recruiter. Evaluate this candidate against job requirements.
-
-Score each dimension from 0 to 100:
-1) skill_score: match between required job skills and candidate skills.
-2) projects_score: relevance/quality of projects and work history against the job description.
-3) experience_score: fit of candidate experience vs minimum required experience.
-
-Important:
-- Compare candidate skills directly with required job skills.
-- Infer project relevance from resume summary and resume excerpt/work history.
-- Penalize clearly missing core skills or insufficient experience.
-- Keep scoring strict and realistic.
-
-Job Description:
-\"\"\"
-{job_description[:6000]}
-\"\"\"
-Required Skills: {job_skills or "N/A"}
-Minimum Experience (years): {min_experience}
-
-Candidate:
-  Name           : {candidate.get("name", "N/A")}
-  Experience     : {candidate.get("total_experience", "N/A")}
-  Skills         : {candidate.get("skills", "N/A")}
-  Education      : {candidate.get("education", "N/A")}
-  Certifications : {candidate.get("certifications", "N/A")}
-  Summary        : {candidate.get("summary", "N/A")}
-
-Resume Excerpt:
-\"\"\"
-{_clean_text(candidate.get("raw_text"))[:6000]}
-\"\"\"
-
-Return ONLY a JSON object with EXACTLY these keys:
-{{"skill_score": <number 0-100>, "projects_score": <number 0-100>, "experience_score": <number 0-100>, "reasoning": "<2-3 sentences>"}}"""
-
-    return _chat_completion_json(
-        system_prompt="You are an HR scoring assistant. Return only valid JSON.",
         user_prompt=prompt,
     )
 
